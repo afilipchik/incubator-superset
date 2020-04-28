@@ -85,7 +85,9 @@ class QueryQuireLockResult(Enum):
 
 def try_acquire_query_lock_or_wait(key, lock_time_seconds=5):
     """
-    Tries to acquire a lock to execute a query. If lock is available it immediatly returns True.
+    Tries to acquire a lock to execute a query. If lock is available it immediately returns
+    QueryQuireLockResult.acquired. Otherwise it waits till lock it free and returns
+    QueryQuireLockResult.released_after_wait without acquiring
     """
 
     logging.info("Trying to aquire query lock for: " + key)
