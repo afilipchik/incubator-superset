@@ -23,6 +23,7 @@ Superset can render.
 from collections import defaultdict, OrderedDict
 import copy
 from datetime import datetime, timedelta
+from enum import Enum
 from functools import reduce
 import hashlib
 import inspect
@@ -31,7 +32,11 @@ import logging
 import math
 import pickle as pkl
 import re
+import time
 import uuid
+
+import dateutil.parser
+import concurrent.futures
 
 from dateutil import relativedelta as rdelta
 from flask import request
@@ -72,9 +77,70 @@ METRIC_KEYS = [
     "size",
 ]
 
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=40)
+
+class QueryQuireLockResult(Enum):
+     aquired = 1
+     released_after_wait = 2
+
+def try_acquire_query_lock_or_wait(key, lock_time_seconds=5):
+    """
+    Tries to acquire a lock to execute a query. If lock is available it immediatly returns True.
+    """
+
+    logging.info("Trying to aquire query lock for: " + key)
+    query_lock_key = key + "_query_lock"
+    if not cache.get(query_lock_key):
+        cache.set(get_query_lock_key(key), True, timeout=lock_time_seconds)
+        logging.info("Lock for: " + key + " acquired")
+        return QueryQuireLockResult.aquired
+    else:
+        while True:
+            logging.info("Lock for: " + key + " is held by someone else. Waiting.")
+            time.sleep(1)
+            if not cache.get(query_lock_key):
+                logging.info("Lock for: " + key + " is released")
+                return QueryQuireLockResult.released_after_wait
+
+
+def get_query_lock_key(key):
+    return key + "_query_lock"
+
+
+def update_query_lock_timeout(key, lock_time_seconds=5):
+    cache.set(get_query_lock_key(key), True, timeout=lock_time_seconds)
+
+
+def does_query_lock_exist(key):
+    return cache.get(get_query_lock_key(key))
+
+
+def release_query_lock(key):
+    logging.info("Releasing lock for: " + key)
+    cache.delete(get_query_lock_key(key))
+
+
+class QueryHeartbeat(object):
+
+    def __init__(self, key, sleep_between_beats_seconds=1):
+        self.key = key
+        self.running = True
+        self.sleep_between_beats_seconds = sleep_between_beats_seconds
+
+    def execute_heartbeat(self):
+        while self.running:
+            time.sleep(self.sleep_between_beats_seconds)
+            logging.info("Extending lock for " + self.key)
+            if does_query_lock_exist(self.key):
+                update_query_lock_timeout(self.key)
+            else:
+                return
+
+    def stop(self):
+        self.running = False
+
 
 class BaseViz(object):
-
     """All visualizations derive this base class"""
 
     viz_type = None
@@ -180,6 +246,20 @@ class BaseViz(object):
         )
         df = self.get_df(query_obj)
         return df.to_dict(orient="records")
+
+    def has_access_to_df(self, query_obj=None):
+        """Returns a pandas dataframe based on the query object"""
+        if not query_obj:
+            query_obj = self.query_obj()
+        if not query_obj:
+            return None
+
+        # The datasource here can be different backend but the interface is common
+        if hasattr(self.datasource, "explain_query"):
+            permission_check_results = self.datasource.explain_query(query_obj)
+            return permission_check_results.status == utils.QueryStatus.SUCCESS
+        else:
+            return True
 
     def get_df(self, query_obj=None):
         """Returns a pandas dataframe based on the query object"""
@@ -381,7 +461,7 @@ class BaseViz(object):
             del payload["df"]
         return payload
 
-    def get_df_payload(self, query_obj=None, **kwargs):
+    def get_df_payload(self, query_obj=None, blocked_query_start_seconds=None, **kwargs):
         """Handles caching around the df payload retrieval"""
         if not query_obj:
             query_obj = self.query_obj()
@@ -390,19 +470,26 @@ class BaseViz(object):
         is_loaded = False
         stacktrace = None
         df = None
-        cached_dttm = datetime.utcnow().isoformat().split(".")[0]
-        if cache_key and cache and not self.force:
+        current_query_start_seconds = datetime.utcnow().timestamp()
+        has_access = self.has_access_to_df(query_obj)
+        query_force = self.force
+        if blocked_query_start_seconds:
+            query_force = False
+
+        if has_access and cache_key and cache and not query_force:
             cache_value = cache.get(cache_key)
             if cache_value:
                 stats_logger.incr("loaded_from_cache")
                 try:
                     cache_value = pkl.loads(cache_value)
-                    df = cache_value["df"]
-                    self.query = cache_value["query"]
-                    self._any_cached_dttm = cache_value["dttm"]
-                    self._any_cache_key = cache_key
-                    self.status = utils.QueryStatus.SUCCESS
-                    is_loaded = True
+                    cached_query_time = dateutil.parser.isoparse(cache_value["dttm"]).timestamp()
+                    if not blocked_query_start_seconds or blocked_query_start_seconds <= cached_query_time:
+                        df = cache_value["df"]
+                        self.query = cache_value["query"]
+                        self._any_cached_dttm = cache_value["dttm"]
+                        self._any_cache_key = cache_key
+                        self.status = utils.QueryStatus.SUCCESS
+                        is_loaded = True
                 except Exception as e:
                     logging.exception(e)
                     logging.error(
@@ -411,44 +498,22 @@ class BaseViz(object):
                 logging.info("Serving from cache")
 
         if query_obj and not is_loaded:
-            try:
-                df = self.get_df(query_obj)
-                if self.status != utils.QueryStatus.FAILED:
-                    stats_logger.incr("loaded_from_source")
-                    is_loaded = True
-            except Exception as e:
-                logging.exception(e)
-                if not self.error_message:
-                    self.error_message = "{}".format(e)
-                self.status = utils.QueryStatus.FAILED
-                stacktrace = utils.get_stacktrace()
+            acquire_lock_result = None
+            if cache and cache_key:
+                acquire_lock_result = try_acquire_query_lock_or_wait(cache_key)
 
-            if (
-                is_loaded
-                and cache_key
-                and cache
-                and self.status != utils.QueryStatus.FAILED
-            ):
+            if acquire_lock_result and acquire_lock_result is QueryQuireLockResult.released_after_wait:
+                return self.get_df_payload(query_obj, query_start_seconds=current_query_start_seconds, **kwargs)
+            else:
+                heartbeat = QueryHeartbeat(cache_key)
+                executor.submit(heartbeat.execute_heartbeat)
                 try:
-                    cache_value = dict(
-                        dttm=cached_dttm,
-                        df=df if df is not None else None,
-                        query=self.query,
-                    )
-                    cache_value = pkl.dumps(cache_value, protocol=pkl.HIGHEST_PROTOCOL)
-
-                    logging.info(
-                        "Caching {} chars at key {}".format(len(cache_value), cache_key)
-                    )
-
-                    stats_logger.incr("set_cache_key")
-                    cache.set(cache_key, cache_value, timeout=self.cache_timeout)
-                except Exception as e:
-                    # cache.set call can fail if the backend is down or if
-                    # the key is too large or whatever other reasons
-                    logging.warning("Could not cache key {}".format(cache_key))
-                    logging.exception(e)
-                    cache.delete(cache_key)
+                    df, stacktrace, cache_dttm = self.execute_query_and_cache(
+                        cache_key, df, is_loaded, query_obj, stacktrace)
+                    self._any_cached_dttm = cache_dttm
+                finally:
+                    heartbeat.stop()
+                    release_query_lock(cache_key)
         return {
             "cache_key": self._any_cache_key,
             "cached_dttm": self._any_cached_dttm,
@@ -462,6 +527,48 @@ class BaseViz(object):
             "stacktrace": stacktrace,
             "rowcount": len(df.index) if df is not None else 0,
         }
+
+    def execute_query_and_cache(self, cache_key, df, is_loaded, query_obj, stacktrace):
+        cached_dttm = None
+        try:
+            df = self.get_df(query_obj)
+            if self.status != utils.QueryStatus.FAILED:
+                stats_logger.incr("loaded_from_source")
+                is_loaded = True
+            cached_dttm = datetime.utcnow().isoformat().split(".")[0]
+        except Exception as e:
+            logging.exception(e)
+            if not self.error_message:
+                self.error_message = "{}".format(e)
+            self.status = utils.QueryStatus.FAILED
+            stacktrace = utils.get_stacktrace()
+        if (
+                is_loaded
+                and cache_key
+                and cache
+                and self.status != utils.QueryStatus.FAILED
+        ):
+            try:
+                cache_value = dict(
+                    dttm=cached_dttm,
+                    df=df if df is not None else None,
+                    query=self.query,
+                )
+                cache_value = pkl.dumps(cache_value, protocol=pkl.HIGHEST_PROTOCOL)
+
+                logging.info(
+                    "Caching {} chars at key {}".format(len(cache_value), cache_key)
+                )
+
+                stats_logger.incr("set_cache_key")
+                cache.set(cache_key, cache_value, timeout=self.cache_timeout)
+            except Exception as e:
+                # cache.set call can fail if the backend is down or if
+                # the key is too large or whatever other reasons
+                logging.warning("Could not cache key {}".format(cache_key))
+                logging.exception(e)
+                cache.delete(cache_key)
+        return df, stacktrace, cached_dttm
 
     def json_dumps(self, obj, sort_keys=False):
         return json.dumps(
